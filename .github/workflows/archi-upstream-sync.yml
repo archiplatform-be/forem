@@ -1,0 +1,48 @@
+name: ArchiPlatform - Automated Upstream Sync (forem/forem)
+
+on:
+  schedule:
+    # Tous les dimanches ? 03h00 (heure belge)
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout archiplatform-be/forem
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "ArchiPlatform Bot"
+          git config user.email "ops@archi-platform.be"
+
+      - name: Fetch official upstream forem/forem
+        run: |
+          git remote add upstream https://github.com/forem/forem.git || true
+          git fetch upstream main
+
+      - name: Merge upstream cleanly or open Pull Request on conflict
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git merge --no-edit upstream/main; then
+            echo "Clean merge succeeded. Pushing to main..."
+            git push origin main
+          else
+            echo "Merge conflict detected with ArchiPlatform overlay! Aborting direct merge and creating a PR instead..."
+            git merge --abort
+            BRANCH="upstream-sync-$(date +%Y%m%d)"
+            git checkout -b "$BRANCH" upstream/main
+            git push -f origin "$BRANCH"
+            gh pr create --base main --head "$BRANCH" \
+              --title "?? [Auto-Sync] Mise ? jour depuis forem/forem ($(date +%Y-%m-%d))" \
+              --body "Des mises ? jour officielles de Forem sont disponibles. Une revue manuelle rapide est requise pour v?rifier la compatibilit? avec la surcouche ArchiPlatform." || true
+          fi
