@@ -29,6 +29,7 @@ namespace :admin do
     collection do
       post :grant
       delete :revoke
+      patch :sub_permissions
     end
   end
   resources :reactions, only: %i[update]
@@ -171,6 +172,14 @@ namespace :admin do
         patch :end_broadcast
         get :fork
       end
+      resources :pages, controller: "event_pages", except: [:show] do
+        member do
+          patch :reorder
+        end
+        collection do
+          post :preview
+        end
+      end
     end
   end
 
@@ -184,6 +193,7 @@ namespace :admin do
       end
     end
     resources :billboards
+    resources :billboard_campaigns, only: %i[index new create edit update]
     resources :billboard_placement_area_configs, only: %i[index edit update]
     resources :html_variants, only: %i[index edit update new create show destroy]
     resources :navigation_links, only: %i[index update create destroy]

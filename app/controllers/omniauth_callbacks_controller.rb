@@ -38,15 +38,19 @@ class OmniauthCallbacksController < Devise::OmniauthCallbacksController
     )
 
     if error.present?
-      is_expected_oauth_error = false
-      
-      if error.class.name == "OmniAuth::Strategies::OAuth2::CallbackError"
-        is_expected_oauth_error = error.message.include?("nonce_mismatch") || error.message.include?("csrf_detected")
-      elsif error.class.name == "OAuth2::Error" || error.class.name == "OAuth::Unauthorized" || error.class.name == "OmniAuth::NoSessionError"
-        is_expected_oauth_error = true # These are all expired/invalid HTTP token grants natively raised by remote provider APIs
-      elsif error.class.name == "StandardError"
-        is_expected_oauth_error = error.message.include?("access_token was nil")
-      end
+      is_expected_oauth_error = case class_name
+                                when "OmniAuth::Strategies::OAuth2::CallbackError"
+                                  error.message.include?("nonce_mismatch") ||
+                                    error.message.include?("csrf_detected") ||
+                                    error.message.include?("user_cancelled_authorize")
+                                when "OAuth2::Error", "OAuth::Unauthorized", "OmniAuth::NoSessionError"
+                                  # Expired/invalid HTTP token grants natively raised by remote provider APIs
+                                  true
+                                when "StandardError"
+                                  error.message.include?("access_token was nil")
+                                else
+                                  false
+                                end
 
       Rails.error.report(error) unless is_expected_oauth_error
     end
@@ -195,24 +199,7 @@ class OmniauthCallbacksController < Devise::OmniauthCallbacksController
       if (external_return = Authentication::ExternalReturn.redirect_url_for(request.env["omniauth.params"]))
         sign_in(@user, event: :authentication)
         redirect_to external_return, allow_other_host: true
-      elsif ApplicationConfig["AUTH_TEST_USER_IDS"].present? && ApplicationConfig["AUTH_TEST_USER_IDS"].split(",").include?(@user.id.to_s)
-        token = generate_auth_token(@user)
-        test_path = ApplicationConfig["AUTH_TEST_USER_REDIRECT_PATH"] || "/menu"
-        redirect_to "#{test_path}?jwt=#{token}"
-      elsif (auth_payload["provider"].to_s.include?("google") && %w[navbar_basic profile].exclude?(cta_variant)) || user_agent == "ForemWebView/1" || @user.email&.start_with?("bendhalpern")
-          # Generate the token the app will use.
-        # (Replace the following with your actual token generation logic.)
-        token = generate_auth_token(@user)
-
-
-  
-  
-        # Render a minimal HTML page that redirects via a custom scheme.
-        test_path = ApplicationConfig["AUTH_TEST_USER_REDIRECT_PATH"] || "/menu"
-        redirect_to "#{test_path}?jwt=#{token}"
       else
-
-
         # Standard behavior for non-mobile requests.
         sign_in_and_redirect(@user, event: :authentication)
       end
@@ -313,13 +300,5 @@ class OmniauthCallbacksController < Devise::OmniauthCallbacksController
     # Try request.origin first, then fallback to referer.
     origin = request.origin.presence || request.referer
     origin && origin.start_with?(trusted_origin)
-  end
-
-  def generate_auth_token(user)
-    payload = {
-      user_id: user.id,
-      exp: 5.minutes.from_now.to_i # Token expires in 5 minutes
-    }
-    JWT.encode(payload, Rails.application.secret_key_base)
   end
 end

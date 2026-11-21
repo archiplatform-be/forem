@@ -40,8 +40,15 @@ module Admin
     def create
       @billboard = Billboard.new(billboard_params)
       @billboard.creator = current_user
+      missing = []
+      saved = Billboard.transaction do
+        @billboard.lock_affected_campaigns!
+        missing = missing_sub_permissions(:save)
+        @billboard.save if missing.empty?
+      end
+      return render_missing_sub_permissions(:new, missing) if missing.any?
 
-      if @billboard.save
+      if saved
         flash[:success] = I18n.t("admin.billboards_controller.created")
         redirect_to edit_admin_billboard_path(@billboard.id)
       else
@@ -52,8 +59,17 @@ module Admin
 
     def update
       @billboard = Billboard.find(params[:id])
+      missing = []
+      saved = false
+      @billboard.with_lock do
+        @billboard.assign_attributes(billboard_params)
+        @billboard.lock_affected_campaigns!
+        missing = missing_sub_permissions(:save)
+        saved = @billboard.save if missing.empty?
+      end
+      return render_missing_sub_permissions(:edit, missing) if missing.any?
 
-      if @billboard.update(billboard_params)
+      if saved
         flash[:success] = I18n.t("admin.billboards_controller.updated")
         redirect_to edit_admin_billboard_path(params[:id])
       else
@@ -64,8 +80,18 @@ module Admin
 
     def destroy
       @billboard = Billboard.find(params[:id])
+      missing = []
+      destroyed = false
+      @billboard.with_lock do
+        @billboard.lock_affected_campaigns!
+        missing = missing_sub_permissions(:destroy)
+        destroyed = @billboard.destroy if missing.empty?
+      end
+      if missing.any?
+        return render json: { error: SubPermissions.missing_message(Billboard, missing) }, status: :forbidden
+      end
 
-      if @billboard.destroy
+      if destroyed
         render json: { message: I18n.t("admin.billboards_controller.deleted") }, status: :ok
       else
         render json: { error: I18n.t("admin.billboards_controller.wrong") }, status: :unprocessable_entity
@@ -80,11 +106,21 @@ module Admin
                     :exclude_article_ids, :audience_segment_id, :priority, :browser_context,
                     :exclude_role_names, :target_role_names, :include_subforem_ids,
                     :render_mode, :template, :custom_display_label, :requires_cookies, :expires_at,
-                    :special_behavior, :minimized_body_markdown)
+                    :special_behavior, :minimized_body_markdown, :billboard_campaign_id,
+                    :max_impressions_count, :max_clicks_count)
     end
 
     def authorize_admin
       authorize Billboard, :access?, policy_class: InternalPolicy
+    end
+
+    def missing_sub_permissions(action)
+      BillboardPolicy.new(current_user, @billboard).missing_sub_permissions(action)
+    end
+
+    def render_missing_sub_permissions(template, missing)
+      flash.now[:danger] = SubPermissions.missing_message(Billboard, missing)
+      render template, status: :forbidden
     end
   end
 end

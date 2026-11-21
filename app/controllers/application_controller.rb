@@ -84,6 +84,13 @@ class ApplicationController < ActionController::Base
   ].freeze
   private_constant :CONTENT_CHANGE_PATHS
 
+  CONTENT_CHANGE_SURROGATE_KEYS = %w[
+    tags
+    onboarding-slideshow
+    main_app_home_page
+  ].freeze
+  private_constant :CONTENT_CHANGE_SURROGATE_KEYS
+
   # @!scope class
   # @!attribute [w] api_action
   #   If set to true, all actions on the class (and subclasses) will be considered "api_actions"
@@ -123,7 +130,12 @@ class ApplicationController < ActionController::Base
   #
   # @raise [ActiveRecord::RecordNotFound] when called
   def not_found
-    if request.env["forem.custom_domain_org"].present?
+    if (org = request.env["forem.custom_domain_org"]).present?
+      # These redirects inherit the action's edge-cache headers. Tag them with the org key, which
+      # EdgeCache::BustArticle purges whenever an org article changes, so a redirect cached while a
+      # post was a draft (or before it existed) doesn't outlive its publication.
+      set_surrogate_key_header(org.record_key)
+
       redirect_rule = RequestRedirect.find_by(
         request_domain: request.host&.downcase,
         original_url: request.fullpath
@@ -259,6 +271,8 @@ class ApplicationController < ActionController::Base
   end
 
   def should_redirect_to_subforem?(article)
+    return false if Subforem.disabled_by_env?
+
     subforem_not_same = article.subforem_id.present? && article.subforem_id != RequestStore.store[:subforem_id]
     subforem_not_default_and_no_subforem_id = article.subforem_id.blank? &&
       RequestStore.store[:subforem_id].present? &&
@@ -267,11 +281,13 @@ class ApplicationController < ActionController::Base
   end
 
   def redirect_page_if_different_subforem
+    return if Subforem.disabled_by_env?
     return unless @page.subforem_id.present? &&
       RequestStore.store[:subforem_id].present? &&
       @page.subforem_id != RequestStore.store[:subforem_id]
 
-    redirect_to URL.page(@page), allow_other_host: true, status: :moved_permanently
+    target_url = embedded_view? ? "#{URL.page(@page)}?mode=embed" : URL.page(@page)
+    redirect_to target_url, allow_other_host: true, status: :moved_permanently
   end
 
   def respond_with_request_for_authentication
@@ -348,6 +364,11 @@ class ApplicationController < ActionController::Base
     params[:i] == "i" || params[:i].to_s.match?(/\A[a-f0-9]{8,12}\z/)
   end
   helper_method :internal_navigation?
+
+  def embedded_view?
+    params[:mode] == "embed"
+  end
+  helper_method :embedded_view?
 
   def feed_style_preference
     Settings::UserExperience.feed_style
@@ -431,15 +452,15 @@ class ApplicationController < ActionController::Base
   end
 
   def current_user_by_token
-    auth_header = request.headers["Authorization"]
-    return unless auth_header.present? && auth_header.start_with?("Bearer ")
+    token = Authentication::AuthToken.extract_bearer_token(request.headers["Authorization"])
+    return unless token
 
-    token = auth_header.split.last
     payload = decode_auth_token(token)
     return unless payload && payload["user_id"]
+    return if payload["purpose"] == Authentication::AuthToken::AUTH_PASS_PURPOSE
 
     user = User.find_by(id: payload["user_id"])
-    return unless user
+    return unless user && Authentication::AuthToken.valid_for_user?(payload, user)
 
     @current_user = user
     @token_authenticated = true
@@ -490,7 +511,7 @@ class ApplicationController < ActionController::Base
   end
 
   def bust_content_change_caches
-    EdgeCache::Bust.call(CONTENT_CHANGE_PATHS)
+    EdgeCache::PurgeByKey.call(CONTENT_CHANGE_SURROGATE_KEYS, fallback_paths: CONTENT_CHANGE_PATHS)
     Settings::General.admin_action_taken_at = Time.current # Used as cache key
   end
 
@@ -535,7 +556,8 @@ class ApplicationController < ActionController::Base
       new_host = host.sub(/^www\./i, "")
       redirect_to("#{request.protocol}#{new_host}#{request.fullpath}", allow_other_host: true,
                                                                        status: :moved_permanently)
-    elsif host.end_with?(".#{RequestStore.store[:root_subforem_domain]}") &&
+    elsif RequestStore.store[:root_subforem_domain].present? &&
+        host.end_with?(".#{RequestStore.store[:root_subforem_domain]}") &&
         RequestStore.store[:subforem_id].blank?
       # Check memory-first cache to avoid redirecting custom organization domains
       cache_key = "org_custom_domain_id:#{host}"
@@ -572,7 +594,8 @@ class ApplicationController < ActionController::Base
     is_custom_org_domain = org_id.present? && org_id != "not_found"
     return if is_custom_org_domain
 
-    is_subforem_subdomain = host.end_with?(".#{RequestStore.store[:root_subforem_domain]}")
+    is_subforem_subdomain = RequestStore.store[:root_subforem_domain].present? &&
+      host.end_with?(".#{RequestStore.store[:root_subforem_domain]}")
     is_registered_subforem = RequestStore.store[:subforem_id].present? &&
       RequestStore.store[:subforem_id] != RequestStore.store[:default_subforem_id]
 

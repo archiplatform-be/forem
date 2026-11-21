@@ -8,7 +8,7 @@ class ApplicationMetalController < ActionController::Metal
   # the specific controller.
 
   protect_from_forgery with: :exception, prepend: true unless Rails.env.test?
-  prepend_before_action :skip_session_commit
+  after_action :skip_session_commit
 
   include SessionCurrentUser
   include ValidRequest
@@ -27,23 +27,22 @@ class ApplicationMetalController < ActionController::Metal
   helper_method :client_geolocation
 
   def current_user_by_token
-    auth_header = request.headers["Authorization"]
-    return unless auth_header || params[:jwt]
-
-    if auth_header.present? && auth_header.start_with?("Bearer ")
-      token = auth_header.split(" ").last
-      payload = decode_auth_token(token)
-    elsif params[:jwt].present?
-      token = params[:jwt]
-      payload = decode_auth_token(token)
+    token = Authentication::AuthToken.extract_bearer_token(request.headers["Authorization"])
+    if token.blank? && (request.post? || request.put? || request.patch?)
+      body_jwt = request.request_parameters["jwt"]
+      token = body_jwt if body_jwt.is_a?(String) && body_jwt.present?
     end
+    return unless token
+
+    payload = decode_auth_token(token)
     return unless payload && payload["user_id"]
+    return if payload["purpose"] == Authentication::AuthToken::AUTH_PASS_PURPOSE
 
     user = User.find_by(id: payload["user_id"])
-    if user
-      @current_user = user
-      @token_authenticated = true
-    end
+    return unless user && Authentication::AuthToken.valid_for_user?(payload, user)
+
+    @current_user = user
+    @token_authenticated = true
   end
 
   def token_authenticated?
@@ -63,7 +62,7 @@ class ApplicationMetalController < ActionController::Metal
 
     encoded_real_token = request.env[CSRF_TOKEN]
     if encoded_real_token.nil?
-      fetched = csrf_token_storage_strategy.fetch(request)
+      fetched = fetch_csrf_token_from_storage(session)
       encoded_real_token = request.env[CSRF_TOKEN] = fetched if fetched
     end
 
@@ -86,6 +85,19 @@ class ApplicationMetalController < ActionController::Metal
 
   private
 
+  def fetch_csrf_token_from_storage(session)
+    if session.respond_to?(:loaded?) && !session.loaded? && request.session_options[:skip]
+      begin
+        request.session_options[:skip] = false
+        csrf_token_storage_strategy.fetch(request)
+      ensure
+        request.session_options[:skip] = true
+      end
+    else
+      csrf_token_storage_strategy.fetch(request)
+    end
+  end
+
   def legacy_decode_auth_token(token)
     JWT.decode(token, Rails.application.secret_key_base, true, algorithm: "HS256")[0]
   rescue JWT::ExpiredSignature
@@ -97,7 +109,10 @@ class ApplicationMetalController < ActionController::Metal
   # Metal controllers are read-only consumers of the session (CSRF verification
   # and session_current_user_id). Skipping Rack's post-request session commit
   # avoids a redundant Redis SETEX and Set-Cookie on every telemetry ping.
+  # Must run as an after_action (not before_action): Rack::Session::Redis#find_session
+  # returns an empty hash without reading Redis if options[:skip] is already true
+  # when the session is first loaded.
   def skip_session_commit
-    request.session_options[:skip] = true
+    request.session_options[:skip] = true unless remembered_user_restored?
   end
 end

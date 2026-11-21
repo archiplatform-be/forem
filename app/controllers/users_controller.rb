@@ -124,6 +124,7 @@ class UsersController < ApplicationController
     set_current_tab("account")
     if @user.email?
       Users::DeleteWorker.perform_async(@user.id)
+      Authentication::AuthToken.revoke_for_user!(@user.id)
       sign_out @user
       flash[:global_notice] = I18n.t("users_controller.deletion_scheduled")
       redirect_to new_user_registration_path
@@ -220,7 +221,8 @@ class UsersController < ApplicationController
 
     not_authorized unless current_user.org_admin?(org) && removable_org_membership
 
-    removable_org_membership.delete
+    # destroy (not delete) so a withdrawn invitation's notification is cleaned up too
+    removable_org_membership.destroy
     flash[:settings_notice] = I18n.t("users_controller.removed_member", name: removable.name)
     redirect_to organization_settings_path(org.slug)
   end

@@ -137,7 +137,9 @@ module Api
         search_params[:optionalWords] = cleaned_words if cleaned_words.size > 1
 
         subforem_id = RequestStore.store[:subforem_id]
-        search_params[:facetFilters] << "subforem_id:#{subforem_id}" if subforem_id.present?
+        if subforem_id.present? && !Subforem.disabled_by_env?
+          search_params[:facetFilters] << "subforem_id:#{subforem_id}"
+        end
         search_params
       end
 
@@ -249,7 +251,7 @@ module Api
 
         page_start = (page - 1) * per_page
         page_end = page * per_page
-        use_jev_shortlist = page_start < JEV_SHORTLIST_SIZE && Ai::FunctionConfig.jev?(:semantic_search_reranking)
+        use_jev_shortlist = page_start < JEV_SHORTLIST_SIZE && Ai::FunctionConfig.decision?(:semantic_search_reranking)
         ids_to_hydrate = if use_jev_shortlist
                            sorted_ids.first([JEV_SHORTLIST_SIZE, page_end].max)
                          else

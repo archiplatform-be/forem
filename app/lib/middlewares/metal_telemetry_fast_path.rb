@@ -97,8 +97,8 @@ module Middlewares
       is_embed = Billboard.embed_origin?(env["HTTP_ORIGIN"])
       return @app.call(env) if verify_csrf!(env, BillboardEventsController, skip: is_embed) == :defer
 
-      skip_session_commit!(env)
       current_user_id = resolve_user_id(env, BillboardEventsController)
+      skip_session_commit!(env)
       rows_updated = BillboardEvent.add_impression_seconds(id: id_str, user_id: current_user_id)
       return head_response(200) if rows_updated.positive?
 
@@ -114,8 +114,8 @@ module Middlewares
       is_embed = Billboard.embed_origin?(env["HTTP_ORIGIN"])
       return @app.call(env) if verify_csrf!(env, BillboardEventsController, skip: is_embed) == :defer
 
-      skip_session_commit!(env)
       user_id = is_embed ? nil : resolve_user_id(env, BillboardEventsController)
+      skip_session_commit!(env)
       geolocation = resolve_geolocation(env, user_id, BillboardEventsController)
 
       if env[Rack::QUERY_STRING].blank? &&
@@ -145,10 +145,14 @@ module Middlewares
       billboard_create_response(billboard_event_id)
     end
 
+    # Executes a prebuilt BillboardEvent INSERT SQL string with single-reconnect
+    # retry on ActiveRecord::ConnectionFailed, returning the new primary key.
     def execute_billboard_insert(sql_or_invalid)
       return unless sql_or_invalid.is_a?(String)
 
-      row = BillboardEvent.connection.exec_query(sql_or_invalid, "BillboardEvent Create").rows.first
+      row = BillboardEvent.with_connection_retry do
+        BillboardEvent.connection.exec_query(sql_or_invalid, "BillboardEvent Create")
+      end.rows.first
       BillboardEvent.type_for_attribute(BillboardEvent.primary_key).cast(row.first) if row
     end
 
@@ -195,8 +199,8 @@ module Middlewares
     def handle_page_view_update(env, id_str)
       return @app.call(env) if verify_csrf!(env, PageViewsController) == :defer
 
-      skip_session_commit!(env)
       current_user_id = resolve_user_id(env, PageViewsController)
+      skip_session_commit!(env)
       Articles::PageViewUpdater.call(article_id: id_str, user_id: current_user_id) if current_user_id
       head_response(200)
     end
@@ -204,7 +208,6 @@ module Middlewares
     def handle_page_view_create(env)
       return @app.call(env) if verify_csrf!(env, PageViewsController) == :defer
 
-      skip_session_commit!(env)
       req = ActionDispatch::Request.new(env)
       raw_params = req.parameters
       page_view_params = raw_params.slice(
@@ -222,6 +225,7 @@ module Middlewares
       end
 
       current_user_id = resolve_user_id(env, PageViewsController)
+      skip_session_commit!(env)
       geo_region = env["HTTP_FASTLY_CLIENT_GEO_REGION"].presence ||
         resolve_geolocation(env, current_user_id, PageViewsController)
       page_view_params[:region] = geo_region
@@ -245,7 +249,7 @@ module Middlewares
       ensure_subforem_context!(req)
       return unless Settings::General.algolia_application_id.present? && Settings::General.algolia_api_key.present?
 
-      AlgoliaInsightsService.new.track_event(
+      AlgoliaInsights::TrackEventWorker.perform_async(
         "view",
         "Article Viewed",
         current_user_id,
@@ -254,24 +258,27 @@ module Middlewares
         Time.current.to_i * 1000,
         nil,
         nil,
+        RequestStore.store[:subforem_id],
       )
     end
 
     def handle_ga_event_create(env)
       return @app.call(env) if verify_csrf!(env, GaEventsController) == :defer
 
-      skip_session_commit!(env)
       req = ActionDispatch::Request.new(env)
       ensure_subforem_context!(req)
       if Settings::General.ga_analytics_4_id.present? && Settings::General.ga_api_secret.present?
         raw_post = req.raw_post
         user_id = resolve_user_id(env, GaEventsController)
+        skip_session_commit!(env)
         base_app_url = resolve_app_url(env)
         event_hash = parse_ga_event_payload(raw_post, base_app_url, user_id)
         return head_response(400) if event_hash == :invalid
 
         client_id = generate_anonymous_client_id(req)
         Ga::TrackEventWorker.perform_async(client_id, event_hash)
+      else
+        skip_session_commit!(env)
       end
 
       [200, { "Content-Type" => "text/plain; charset=utf-8" }, [""]]
@@ -291,7 +298,7 @@ module Middlewares
         "page_path" => json["path"],
         "user_id" => user_id,
         "user_language" => json["user_language"],
-        "referrer" => referrer && !referrer.start_with?(base_app_url) ? referrer : nil,
+        "referrer" => referrer.is_a?(String) && !referrer.start_with?(base_app_url) ? referrer : nil,
         "user_agent" => json["user_agent"],
         "viewport_size" => json["viewport_size"],
         "screen_resolution" => json["screen_resolution"],
@@ -326,7 +333,7 @@ module Middlewares
     def handle_feed_events_create(env)
       req = ActionDispatch::Request.new(env)
       raw_params = req.parameters
-      token_user_id = resolve_token_user_id(env, raw_params)
+      token_user_id = resolve_token_user_id(env, req.request_parameters)
       csrf_status = verify_csrf!(
         env,
         FeedEventsController,
@@ -335,8 +342,8 @@ module Middlewares
       )
       return @app.call(env) if csrf_status == :defer
 
-      skip_session_commit!(env)
       current_user_id = token_user_id || resolve_user_id(env, FeedEventsController)
+      skip_session_commit!(env)
       return head_response(200) if !current_user_id || FeatureFlag.enabled?(:disable_browser_feed_events)
 
       raw_events = raw_params["feed_events"]
@@ -375,7 +382,7 @@ module Middlewares
     def handle_feed_config_visit_create(env)
       req = ActionDispatch::Request.new(env)
       raw_params = req.parameters
-      token_user_id = resolve_token_user_id(env, raw_params)
+      token_user_id = resolve_token_user_id(env, req.request_parameters)
       csrf_status = verify_csrf!(
         env,
         FeedConfigVisitsController,
@@ -384,8 +391,8 @@ module Middlewares
       )
       return @app.call(env) if csrf_status == :defer
 
-      skip_session_commit!(env)
       current_user_id = token_user_id || resolve_user_id(env, FeedConfigVisitsController)
+      skip_session_commit!(env)
       return no_content_no_store_response unless current_user_id
       return no_content_no_store_response if FeatureFlag.enabled?(:disable_browser_feed_events)
 
@@ -455,22 +462,23 @@ module Middlewares
       session_opts[:skip] = true if session_opts
     end
 
-    def resolve_token_user_id(env, raw_params)
-      auth_header = env["HTTP_AUTHORIZATION"]
-      jwt_param = raw_params&.[]("jwt")
-      return unless auth_header || jwt_param
-
-      token = if auth_header.present? && auth_header.start_with?("Bearer ")
-                auth_header.split.last
-              elsif jwt_param.present?
-                jwt_param
-              end
-      return unless token.is_a?(String)
+    def resolve_token_user_id(env, request_body_params)
+      token = Authentication::AuthToken.extract_bearer_token(env["HTTP_AUTHORIZATION"])
+      if token.blank? && request_body_params.is_a?(Hash)
+        body_jwt = request_body_params["jwt"]
+        token = body_jwt if body_jwt.is_a?(String) && body_jwt.present?
+      end
+      return unless token
 
       payload = decode_auth_token(token)
       return unless payload && payload["user_id"]
+      return if payload["purpose"] == Authentication::AuthToken::AUTH_PASS_PURPOSE
 
-      User.where(id: payload["user_id"]).pick(:id)
+      user = User.select(:id, :encrypted_password, :current_sign_in_at, :last_sign_in_at, :locked_at)
+        .find_by(id: payload["user_id"])
+      return unless user && Authentication::AuthToken.valid_for_user?(payload, user)
+
+      user.id
     end
 
     def decode_auth_token(token)
@@ -488,10 +496,7 @@ module Middlewares
         return controller_class.allocate.session_current_user_id
       end
 
-      session = env[Rack::RACK_SESSION]
-      return unless session
-
-      session["warden.user.user.key"]&.first&.first
+      read_session_key(env, "warden.user.user.key")&.first&.first
     end
 
     def resolve_geolocation(env, user_id, controller_class)
@@ -531,9 +536,26 @@ module Middlewares
       token = env[ActionController::RequestForgeryProtection::CSRF_TOKEN]
       return token if token
 
-      token = env[Rack::RACK_SESSION]&.[]("_csrf_token")
+      token = read_session_key(env, "_csrf_token")
       env[ActionController::RequestForgeryProtection::CSRF_TOKEN] = token if token
       token
+    end
+
+    def read_session_key(env, key)
+      session = env[Rack::RACK_SESSION]
+      return unless session
+
+      session_opts = env[Rack::RACK_SESSION_OPTIONS]
+      if session.respond_to?(:loaded?) && !session.loaded? && session_opts&.[](:skip)
+        begin
+          session_opts[:skip] = false
+          session[key]
+        ensure
+          session_opts[:skip] = true
+        end
+      else
+        session[key]
+      end
     end
 
     def check_request_origin!(env)

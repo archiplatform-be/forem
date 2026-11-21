@@ -277,6 +277,47 @@ RSpec.describe Authentication::Authenticator, type: :service do
         expect(user.github_username).to eq(info.nickname)
       end
 
+      # On a fresh production database the setting is never stored, so it falls
+      # back to `!User.exists?`, which turns false once the first user is saved.
+      it "grants creator roles to the first user when the setting falls back to its default",
+         :aggregate_failures do
+        allow(Settings::General).to receive(:waiting_on_first_user).and_call_original
+        expect(Settings::General.where(var: "waiting_on_first_user")).not_to exist
+        expect(User).not_to exist
+
+        user = service.call
+
+        expect(user).to be_creator
+        expect(user).to be_super_admin
+        expect(user).to be_trusted
+        expect(Settings::General.mascot_user_id).to eq(User.mascot_account.id)
+      end
+
+      it "does not grant creator roles from a stale setting value once another signup claimed them",
+         :aggregate_failures do
+        create(:user)
+        Settings::General.unscoped.create!(var: "waiting_on_first_user", value: false)
+        allow(Settings::General).to receive(:waiting_on_first_user).and_return(true)
+
+        user = service.call
+
+        expect(user).not_to be_creator
+        expect(user).not_to be_super_admin
+        expect(user).not_to be_trusted
+      end
+
+      %w[LoGiN signup].each do |nickname|
+        it "registers a GitHub user with the reserved nickname #{nickname}" do
+          auth_payload.info.nickname = nickname
+
+          user = service.call
+
+          expect(user).to be_persisted
+          expect(user.username).to match(/\A#{nickname.downcase}_\d+\z/)
+          expect(user.github_username).to eq(nickname)
+        end
+      end
+
       it "queues a slack message to be sent for a user whose identity is brand new" do
         auth_payload.extra.raw_info.created_at = 1.minute.ago.rfc3339
 
@@ -977,6 +1018,152 @@ RSpec.describe Authentication::Authenticator, type: :service do
         expect(identity.uid).to eq(auth_payload.uid)
         expect(identity.auth_data_dump.info.email).to eq(auth_payload.info.email)
       end
+    end
+  end
+
+  describe "concurrent signup and email normalization" do
+    let(:auth_payload) { OmniAuth.config.mock_auth[:github].deep_dup }
+
+    it "matches an existing user when the provider returns an uppercase or padded email", :aggregate_failures do
+      existing_user = create(:user, email: "mixedcase@example.com")
+      auth_payload.info.email = "  MixedCase@Example.com "
+
+      authenticated_user = nil
+      expect do
+        authenticated_user = described_class.call(auth_payload)
+      end.to not_change(User, :count).and change(Identity, :count).by(1)
+
+      expect(authenticated_user).to eq(existing_user)
+      expect(Identity.find_by(provider: "github", uid: auth_payload.uid)&.user).to eq(existing_user)
+    end
+
+    it "recovers when a concurrent callback inserts the user and raises RecordNotUnique", :aggregate_failures do
+      allow(ForemStatsClient).to receive(:increment)
+      concurrent_user = create(:user, email: auth_payload.info.email, github_username: auth_payload.info.nickname)
+      create(:identity, user: concurrent_user, provider: "github", uid: auth_payload.uid)
+
+      unpersisted_identity = Identity.new(
+        provider: auth_payload.provider,
+        uid: auth_payload.uid,
+        token: auth_payload.credentials.token,
+        secret: auth_payload.credentials.secret,
+        auth_data_dump: auth_payload,
+      )
+      first_lookup = true
+      allow(Identity).to receive(:build_from_omniauth).and_wrap_original do |original, *args|
+        if first_lookup
+          first_lookup = false
+          unpersisted_identity
+        else
+          original.call(*args)
+        end
+      end
+
+      service = described_class.new(auth_payload)
+      first_proper_user = true
+      allow(service).to receive(:proper_user).and_wrap_original do |original, *args|
+        if first_proper_user
+          first_proper_user = false
+          nil
+        else
+          original.call(*args)
+        end
+      end
+
+      first_find = true
+      allow(User).to receive(:find_by).and_wrap_original do |original, *args|
+        if first_find && args.first == { github_username: auth_payload.info.nickname }
+          first_find = false
+          nil
+        else
+          original.call(*args)
+        end
+      end
+
+      first_save = true
+      allow(User).to receive(:new).and_wrap_original do |original, *args|
+        user_instance = original.call(*args)
+        if first_save
+          first_save = false
+          allow(user_instance).to receive(:save!).and_raise(
+            ActiveRecord::RecordNotUnique,
+            'PG::UniqueViolation: ERROR: duplicate key value violates unique constraint "index_users_on_email"',
+          )
+        end
+        user_instance
+      end
+
+      authenticated_user = service.call
+
+      expect(authenticated_user).to eq(concurrent_user)
+      expect(User.where(email: auth_payload.info.email).count).to eq(1)
+      expect(Identity.where(provider: "github", uid: auth_payload.uid).count).to eq(1)
+      expect(ForemStatsClient).not_to have_received(:increment).with("identity.errors", anything)
+    end
+
+    it "recovers when a concurrent callback commits the user before validation runs", :aggregate_failures do
+      allow(ForemStatsClient).to receive(:increment)
+      concurrent_user = create(:user, email: auth_payload.info.email, github_username: auth_payload.info.nickname)
+      create(:identity, user: concurrent_user, provider: "github", uid: auth_payload.uid)
+
+      unpersisted_identity = Identity.new(
+        provider: auth_payload.provider,
+        uid: auth_payload.uid,
+        token: auth_payload.credentials.token,
+        secret: auth_payload.credentials.secret,
+        auth_data_dump: auth_payload,
+      )
+      first_lookup = true
+      allow(Identity).to receive(:build_from_omniauth).and_wrap_original do |original, *args|
+        if first_lookup
+          first_lookup = false
+          unpersisted_identity
+        else
+          original.call(*args)
+        end
+      end
+
+      service = described_class.new(auth_payload)
+      first_proper_user = true
+      allow(service).to receive(:proper_user).and_wrap_original do |original, *args|
+        if first_proper_user
+          first_proper_user = false
+          nil
+        else
+          original.call(*args)
+        end
+      end
+
+      first_find = true
+      allow(User).to receive(:find_by).and_wrap_original do |original, *args|
+        if first_find && args.first == { github_username: auth_payload.info.nickname }
+          first_find = false
+          nil
+        else
+          original.call(*args)
+        end
+      end
+
+      authenticated_user = service.call
+
+      expect(authenticated_user).to eq(concurrent_user)
+      expect(User.where(email: auth_payload.info.email).count).to eq(1)
+      expect(Identity.where(provider: "github", uid: auth_payload.uid).count).to eq(1)
+      expect(ForemStatsClient).not_to have_received(:increment).with("identity.errors", anything)
+    end
+
+    it "re-raises RecordNotUnique and records identity.errors if the conflict persists", :aggregate_failures do
+      allow(ForemStatsClient).to receive(:increment)
+      # rubocop:disable RSpec/AnyInstance
+      allow_any_instance_of(User).to receive(:save!).and_raise(ActiveRecord::RecordNotUnique, "duplicate key")
+      # rubocop:enable RSpec/AnyInstance
+
+      expect do
+        described_class.call(auth_payload)
+      end.to raise_error(ActiveRecord::RecordNotUnique)
+
+      tags = hash_including(tags: array_including("error:ActiveRecord::RecordNotUnique"))
+      expect(ForemStatsClient).to have_received(:increment).with("identity.errors", tags).once
     end
   end
 end

@@ -26,41 +26,55 @@ module UnifiedEmbed
     ].freeze
 
     def self.new(tag_name, input, parse_context)
-      stripped_input = ActionController::Base.helpers.strip_tags(input).strip
-
-      # Parse input to check for 'minimal' keyword
-      parts = stripped_input.split(/\s+/)
-      minimal_mode = parts.include?("minimal")
-
-      # Find the URL (first part that looks like a URL)
-      url = parts.find { |part| part.match?(%r{^https?://}) } || parts.first
-
+      url, minimal_mode, extra_options = parse_embed_input(input)
       handler_before_validation = UnifiedEmbed::Registry.find_handler_for(link: url)
 
       begin
-        validated_link = if handler_before_validation&.dig(:skip_validation)
-                           url
-                         else
-                           validate_link(input: url)
-                         end
+        validated_link = resolve_validated_link(url, handler_before_validation)
+        klass = resolve_embed_klass(validated_link, minimal_mode, handler_before_validation)
+        tag_input = build_tag_input(klass, validated_link, extra_options)
 
-        # In minimal mode, only use allow-listed embeds, otherwise fall back to OpenGraphTag
-        klass = if minimal_mode
-                  if handler_before_validation && MINIMAL_ALLOWLIST.include?(handler_before_validation[:klass])
-                    handler_before_validation[:klass]
-                  else
-                    OpenGraphTag
-                  end
-                else
-                  UnifiedEmbed::Registry.find_liquid_tag_for(link: validated_link)
-                end
-
-        klass.__send__(:new, tag_name, validated_link, parse_context)
+        klass.__send__(:new, tag_name, tag_input, parse_context)
       rescue SocketError, Timeout::Error, Errno::ECONNREFUSED, Errno::EHOSTUNREACH, OpenSSL::SSL::SSLError => e
         Rails.logger.warn("[UnifiedEmbed::Tag] Network/SSL error during validation for '#{url}': #{e.class} - #{e.message}")
         FallbackTag.__send__(:new, tag_name, url, parse_context)
       end
     end
+
+    def self.parse_embed_input(input)
+      stripped_input = ActionController::Base.helpers.strip_tags(input).strip
+      parts = stripped_input.split(/\s+/)
+      minimal_mode = parts.include?("minimal")
+      non_minimal_parts = parts.reject { |part| part == "minimal" }
+      url = non_minimal_parts.detect { |part| part.match?(%r{\A(?:https?://|/(?!/))}) } || parts.first
+      extra_options = non_minimal_parts.reject { |part| part == url }
+      [url, minimal_mode, extra_options]
+    end
+    private_class_method :parse_embed_input
+
+    def self.resolve_validated_link(url, handler_before_validation)
+      if handler_before_validation&.dig(:skip_validation)
+        handler_before_validation[:expanded_link] || url
+      else
+        validate_link(input: url)
+      end
+    end
+    private_class_method :resolve_validated_link
+
+    def self.resolve_embed_klass(validated_link, minimal_mode, handler_before_validation)
+      return UnifiedEmbed::Registry.find_liquid_tag_for(link: validated_link) unless minimal_mode
+      return handler_before_validation[:klass] if handler_before_validation && MINIMAL_ALLOWLIST.include?(handler_before_validation[:klass])
+
+      OpenGraphTag
+    end
+    private_class_method :resolve_embed_klass
+
+    def self.build_tag_input(klass, validated_link, extra_options)
+      return validated_link unless klass == PageTag && extra_options.any?
+
+      ([validated_link] + extra_options).join(" ")
+    end
+    private_class_method :build_tag_input
 
     def self.validate_link(input:, retries: MAX_REDIRECTION_COUNT, method: Net::HTTP::Head)
       uri = URI.parse(input.to_s.split.first.to_s)
@@ -70,11 +84,14 @@ module UnifiedEmbed
 
       return input if uri.host == "twitter.com" || uri.host == "x.com" || uri.host == "bsky.app"
 
-      # Prevent SSRF attacks on internal networks
-      raise StandardError, I18n.t("liquid_tags.unified_embed.tag.invalid_url") if private_ip?(uri.host)
+      # Prevent SSRF and DNS-rebinding attacks by resolving once and pinning the IP
+      resolved_ip = resolve_public_ip(uri.hostname)
+      raise StandardError, I18n.t("liquid_tags.unified_embed.tag.invalid_url") unless resolved_ip
 
-      # Build HTTP client with correct port and TLS based on scheme
-      http = Net::HTTP.new(uri.host, uri.port)
+      # Build HTTP client with correct port and TLS based on scheme;
+      # pass p_addr=nil to disable ENV proxy discovery and pin the validated IP.
+      http = Net::HTTP.new(uri.host, uri.port, nil)
+      http.ipaddr = resolved_ip
       http.use_ssl = true if uri.scheme == "https"
       
       # Set security timeouts to prevent hanging requests
@@ -110,9 +127,11 @@ module UnifiedEmbed
 
         validate_link(input: next_url, retries: retries - 1)
       when Net::HTTPMethodNotAllowed
-        raise StandardError, I18n.t("liquid_tags.unified_embed.tag.invalid_url") if retries.zero?
+        if retries.zero? || method != Net::HTTP::Head
+          raise StandardError, I18n.t("liquid_tags.unified_embed.tag.invalid_url")
+        end
 
-        validate_link(input: input, retries: retries, method: Net::HTTP::Get)
+        validate_link(input: input, retries: retries - 1, method: Net::HTTP::Get)
       when Net::HTTPNotFound
         raise StandardError, I18n.t("liquid_tags.unified_embed.tag.not_found")
       else
@@ -135,34 +154,31 @@ module UnifiedEmbed
     #   - IPv6 unique-local (fc00::/7)
     # Resolution failure is treated as DENY: if we cannot confirm a host is public,
     # we must not fetch it.
-    def self.private_ip?(hostname)
-      # Deny nil, empty, or blank hostnames — if we cannot identify the host,
-      # we must not fetch it. This also prevents TypeError from IPAddr.new(nil)
-      # and Addrinfo.getaddrinfo(nil, ...) when URI.parse yields a nil host.
-      return true if hostname.blank?
+    # Resolves hostname once and returns the first public IP string, or nil if
+    # the hostname is blank, unresolvable, or resolves to any blocked IP.
+    def self.resolve_public_ip(hostname)
+      return if hostname.blank?
 
-      return true if %w[localhost 127.0.0.1 ::1].include?(hostname)
+      clean_host = hostname.delete_prefix("[").delete_suffix("]")
+      return if %w[localhost 127.0.0.1 ::1].include?(clean_host)
 
-      # First try to parse as IP address directly
       begin
-        ip = IPAddr.new(hostname)
-        return blocked_ip?(ip)
+        ip = IPAddr.new(clean_host)
+        return blocked_ip?(ip) ? nil : ip.to_s
       rescue IPAddr::InvalidAddressError, IPAddr::AddressFamilyError
         # Not a bare IP literal; fall through to DNS resolution
       end
 
-      # Resolve hostname to IP addresses and check each one.
-      # Deny on resolution failure — an unresolvable host's IP range is unknown.
-      begin
-        Addrinfo.getaddrinfo(hostname, nil, nil, :STREAM).each do |addr|
-          ip = IPAddr.new(addr.ip_address)
-          return true if blocked_ip?(ip)
-        end
-        false
-      rescue SocketError, IPAddr::InvalidAddressError, IPAddr::AddressFamilyError
-        # Cannot resolve: treat as private/blocked to be safe
-        true
-      end
+      addresses = Addrinfo.getaddrinfo(clean_host, nil, nil, :STREAM).map { |addr| IPAddr.new(addr.ip_address) }
+      return if addresses.empty? || addresses.any? { |ip| blocked_ip?(ip) }
+
+      addresses.first.to_s
+    rescue SocketError, IPAddr::InvalidAddressError, IPAddr::AddressFamilyError
+      nil
+    end
+
+    def self.private_ip?(hostname)
+      resolve_public_ip(hostname).nil?
     end
 
     # Returns true for any IP address that should be blocked from outbound fetches.

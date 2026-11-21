@@ -1,7 +1,7 @@
 module Api
   module V0
     class EventsController < ApiController
-      skip_before_action :verify_authenticity_token, only: %i[create update destroy]
+      skip_csrf_unless_cookie_authenticated only: %i[create update destroy]
       before_action :authenticate!, except: %i[index show]
       before_action :set_event, only: %i[show update destroy]
 
@@ -88,6 +88,7 @@ module Api
           :full_details,
           :primary_stream_url,
           :published,
+          :allow_articles,
           :start_time,
           :end_time,
           :type_of,

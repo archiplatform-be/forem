@@ -84,6 +84,13 @@ RSpec.describe "/admin/customization/billboards" do
         get edit_admin_billboard_path(billboard.id)
         expect(response).to have_http_status(:ok)
       end
+
+      it "shows the campaign assignment and individual cap fields" do
+        get edit_admin_billboard_path(billboard.id)
+
+        expect(response.body).to include('name="billboard_campaign_id"', 'name="max_impressions_count"',
+                                         'name="max_clicks_count"')
+      end
     end
 
     describe "GET /admin/customization/billboards/:id" do
@@ -122,6 +129,24 @@ RSpec.describe "/admin/customization/billboards" do
     end
 
     describe "POST /admin/customization/billboards" do
+      it "creates a billboard with a campaign and individual caps", :aggregate_failures do
+        campaign = BillboardCampaign.create!(name: "Launch")
+
+        post admin_billboards_path, params: params.merge(billboard_campaign_id: campaign.id,
+                                                         max_impressions_count: 200, max_clicks_count: 10)
+
+        expect(response).to have_http_status(:redirect)
+        expect(Billboard.last).to have_attributes(billboard_campaign_id: campaign.id, max_impressions_count: 200,
+                                                  max_clicks_count: 10)
+      end
+
+      it "rejects a nonexistent campaign rather than saving an invalid association", :aggregate_failures do
+        expect do
+          post admin_billboards_path, params: params.merge(billboard_campaign_id: -1)
+        end.not_to change(Billboard, :count)
+        expect(response.body).to include("Billboard campaign")
+      end
+
       it "creates a new billboard and sets creator to current_user", :aggregate_failures do
         expect do
           post_resource
@@ -154,6 +179,16 @@ RSpec.describe "/admin/customization/billboards" do
 
     describe "PUT /admin/customization/billboards" do
       let!(:billboard) { create(:billboard, approved: false, organization: nil) }
+
+      it "can remove a billboard from a campaign without changing its individual limits", :aggregate_failures do
+        campaign = BillboardCampaign.create!(name: "Launch")
+        billboard.update!(billboard_campaign: campaign, max_clicks_count: 10)
+
+        put admin_billboard_path(billboard), params: { billboard_campaign_id: "" }
+
+        expect(response).to redirect_to(edit_admin_billboard_path(billboard))
+        expect(billboard.reload).to have_attributes(billboard_campaign_id: nil, max_clicks_count: 10)
+      end
 
       it "updates Billboard's approved and priority values and redirects back to edit path", :aggregate_failures do
         Timecop.freeze(Time.current) do
@@ -228,6 +263,100 @@ RSpec.describe "/admin/customization/billboards" do
           delete admin_billboard_path(billboard.id)
         end.to change(Billboard, :count).by(-1)
       end
+    end
+  end
+
+  context "when the user is a Billboard admin with restricted sub-permissions" do
+    let(:restricted_admin) do
+      create(:user, :single_resource_admin, :without_profile, profile_image: nil, resource: Billboard)
+    end
+    let(:draft_params) { params.merge(approved: false, published: false) }
+
+    before do
+      SubPermissions.update_grant(user: restricted_admin, resource_type: "Billboard",
+                                  sub_permissions: SubPermissions.build(allow: []))
+      sign_in restricted_admin
+    end
+
+    it "creates an unapproved, unpublished billboard" do
+      expect { post admin_billboards_path, params: draft_params }.to change(Billboard, :count).by(1)
+      expect(Billboard.last).to have_attributes(approved: false, published: false, creator_id: restricted_admin.id)
+    end
+
+    it "refuses to add a draft billboard to a campaign with an approved billboard", :aggregate_failures do
+      campaign = BillboardCampaign.create!(name: "Live campaign")
+      create(:billboard, billboard_campaign: campaign, approved: true, organization: nil)
+      draft = create(:billboard, approved: false, organization: nil)
+
+      put admin_billboard_path(draft), params: { billboard_campaign_id: campaign.id }
+
+      expect(response).to have_http_status(:forbidden)
+      expect(draft.reload.billboard_campaign_id).to be_nil
+    end
+
+    it "refuses to create a live billboard and shows why", :aggregate_failures do
+      expect { post_resource }.not_to change(Billboard, :count)
+
+      expect(response).to have_http_status(:forbidden)
+      expect(response.body).to include(CGI.escapeHTML("Your Billboard admin access does not include: " \
+                                                      "approve billboards and publish billboards."))
+    end
+
+    it "edits an unapproved billboard but refuses to approve it", :aggregate_failures do
+      draft = create(:billboard, approved: false, published: false, organization: nil)
+
+      put admin_billboard_path(draft.id), params: { name: "Renamed" }
+      expect(draft.reload.name).to eq("Renamed")
+
+      put admin_billboard_path(draft.id), params: { approved: true }
+      expect(response).to have_http_status(:forbidden)
+      expect(draft.reload).not_to be_approved
+    end
+
+    it "refuses to edit an approved billboard but lets it be taken down", :aggregate_failures do
+      live = create(:billboard, approved: true, published: true, organization: nil)
+
+      put admin_billboard_path(live.id), params: { body_markdown: "Swapped after approval" }
+      expect(response).to have_http_status(:forbidden)
+      expect(live.reload.body_markdown).not_to eq("Swapped after approval")
+
+      put admin_billboard_path(live.id), params: { published: false }
+      expect(live.reload).not_to be_published
+    end
+
+    it "refuses to delete an approved billboard", :aggregate_failures do
+      live = create(:billboard, approved: true, published: true, organization: nil)
+
+      expect { delete admin_billboard_path(live.id) }.not_to change(Billboard, :count)
+      expect(response).to have_http_status(:forbidden)
+      expect(response.parsed_body["error"]).to include("change or delete approved billboards")
+    end
+
+    it "refuses to delete a billboard another request approved after it was loaded", :aggregate_failures do
+      draft = create(:billboard, approved: false, organization: nil)
+      allow(Billboard).to receive(:find).and_wrap_original do |original, *args|
+        original.call(*args).tap { |loaded| Billboard.where(id: loaded.id).update_all(approved: true) }
+      end
+
+      expect { delete admin_billboard_path(draft.id) }.not_to change(Billboard, :count)
+      expect(response).to have_http_status(:forbidden)
+    end
+
+    it "refuses to edit a billboard another request approved after it was loaded", :aggregate_failures do
+      draft = create(:billboard, approved: false, organization: nil)
+      allow(Billboard).to receive(:find).and_wrap_original do |original, *args|
+        original.call(*args).tap { |loaded| Billboard.where(id: loaded.id).update_all(approved: true) }
+      end
+
+      put admin_billboard_path(draft.id), params: { body_markdown: "Swapped after approval" }
+      expect(response).to have_http_status(:forbidden)
+      expect(draft.reload.body_markdown).not_to eq("Swapped after approval")
+    end
+
+    it "deletes an unapproved billboard" do
+      draft = create(:billboard, approved: false, organization: nil)
+
+      expect { delete admin_billboard_path(draft.id) }.to change(Billboard, :count).by(-1)
     end
   end
 
