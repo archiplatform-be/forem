@@ -2,7 +2,7 @@ name: ArchiPlatform - Automated Upstream Sync (forem/forem)
 
 on:
   schedule:
-    # Tous les dimanches ? 03h00 (heure belge)
+    # Tous les dimanches à 03h00 (heure belge)
     - cron: '0 2 * * 0'
   workflow_dispatch:
 
@@ -14,35 +14,56 @@ jobs:
   sync-upstream:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout archiplatform-be/forem
+      - name: Sync fork with upstream forem/forem via GitHub API
+        env:
+          GH_TOKEN: ${{ secrets.ARCHI_SYNC_TOKEN }}
+        run: |
+          set -e
+          echo "🔄 Synchronisation de archiplatform-be/forem avec upstream forem:main..."
+          HTTP_CODE=$(curl -sS -o /tmp/merge_resp.json -w "%{http_code}" \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            https://api.github.com/repos/archiplatform-be/forem/merge-upstream \
+            -d '{"branch":"main"}')
+          cat /tmp/merge_resp.json
+          echo ""
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Synchronisation réussie (ou déjà à jour) !"
+            # Désactiver automatiquement tout nouveau workflow interne que DEV.to aurait ajouté
+            gh api repos/archiplatform-be/forem/actions/workflows --paginate -q '.workflows[] | select(.path | contains("archi-") | not) | select(.state == "active") | .id' | while read -r WF_ID; do
+              if [ -n "$WF_ID" ]; then
+                echo "Désactivation du nouveau workflow upstream ID $WF_ID..."
+                gh api -X PUT "repos/archiplatform-be/forem/actions/workflows/$WF_ID/disable" || true
+              fi
+            done
+            exit 0
+          elif [ "$HTTP_CODE" = "409" ]; then
+            echo "⚠️ Conflit détecté avec la surcouche ArchiPlatform -> Création d'une Pull Request de revue..."
+          else
+            echo "❌ Erreur HTTP $HTTP_CODE lors de l'appel merge-upstream"
+            exit 1
+          fi
+
+      - name: Open Pull Request if conflict (HTTP 409)
+        if: failure()
         uses: actions/checkout@v4
         with:
+          token: ${{ secrets.ARCHI_SYNC_TOKEN }}
           fetch-depth: 0
 
-      - name: Configure Git identity
+      - name: Push upstream branch and open PR on conflict
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.ARCHI_SYNC_TOKEN }}
         run: |
           git config user.name "ArchiPlatform Bot"
           git config user.email "ops@archi-platform.be"
-
-      - name: Fetch official upstream forem/forem
-        run: |
           git remote add upstream https://github.com/forem/forem.git || true
           git fetch upstream main
-
-      - name: Merge upstream cleanly or open Pull Request on conflict
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if git merge --no-edit upstream/main; then
-            echo "Clean merge succeeded. Pushing to main..."
-            git push origin main
-          else
-            echo "Merge conflict detected with ArchiPlatform overlay! Aborting direct merge and creating a PR instead..."
-            git merge --abort
-            BRANCH="upstream-sync-$(date +%Y%m%d)"
-            git checkout -b "$BRANCH" upstream/main
-            git push -f origin "$BRANCH"
-            gh pr create --base main --head "$BRANCH" \
-              --title "?? [Auto-Sync] Mise ? jour depuis forem/forem ($(date +%Y-%m-%d))" \
-              --body "Des mises ? jour officielles de Forem sont disponibles. Une revue manuelle rapide est requise pour v?rifier la compatibilit? avec la surcouche ArchiPlatform." || true
-          fi
+          BRANCH="upstream-sync-$(date +%Y%m%d)"
+          git checkout -b "$BRANCH" upstream/main
+          git push -f origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" \
+            --title "🔄 [Auto-Sync] Mise à jour depuis forem/forem ($(date +%Y-%m-%d))" \
+            --body "Des mises à jour officielles de Forem sont disponibles. Une revue manuelle rapide est requise." || true
